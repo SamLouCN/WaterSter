@@ -47,9 +47,14 @@ def main():
                         help='Unsupported by the YOLO Web service; hardware decode is required')
     parser.add_argument('--no-nginx', action='store_true',
                         help='Start only the backend; use --host 0.0.0.0 for direct access')
+    parser.add_argument('--detections-only', action='store_true',
+                        help='Publish coordinates without drawing or JPEG preview encoding')
     args = parser.parse_args()
     if min(args.width, args.height, args.fps) <= 0 or not 1 <= args.port <= 65535:
         parser.error('Invalid frame dimensions, frame rate, or port')
+    if not args.detections_only and (args.width % 16 or args.height % 8
+                                     or max(args.width, args.height) > 8192):
+        parser.error('JPU preview requires width aligned to 16, height to 8, dimensions <=8192')
     if args.no_hw_decode:
         parser.error('The YOLO Web service requires hardware decoding; omit --no-hw-decode')
     if not args.no_nginx and (args.port != 8080 or args.host not in ('127.0.0.1', '0.0.0.0')):
@@ -67,7 +72,8 @@ def main():
     camera = FrontCamera(args.device, args.width, args.height, args.fps,
                          hardware_decode=not args.no_hw_decode)
     # Bind before starting capture so a port conflict never opens the camera.
-    server = CameraServer((args.host, args.port), camera)
+    server = CameraServer((args.host, args.port), camera,
+                          preview_enabled=not args.detections_only)
 
     def stop(signum, _frame):
         LOG.info('Stopping on signal %s', signum)

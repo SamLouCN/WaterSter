@@ -23,9 +23,9 @@ class CameraServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, camera):
+    def __init__(self, server_address, camera, preview_enabled=True):
         self.camera = camera
-        self.preview = YoloTestTask(camera)
+        self.preview = YoloTestTask(camera, preview_enabled=preview_enabled)
         super().__init__(server_address, Handler)
 
     def serve_forever(self, poll_interval=.5):
@@ -135,6 +135,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             self.wfile.write(data)
+            return
+        if path == '/detections':
+            result = self.server.preview.result()
+            age = result['age_seconds']
+            ready = (result['running'] and not result['error']
+                     and result.get('sequence', 0) > 0 and age is not None and age < 3)
+            data = json.dumps(result).encode('utf-8')
+            self.send_response(200 if ready else 503)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path in ('/frame.jpg', '/stream.mjpg') and not self.server.preview.preview_enabled:
+            self.send_error(503, 'JPEG preview disabled by --detections-only; use /detections')
             return
         if path == '/health':
             status = self.server.preview.status()
