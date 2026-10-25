@@ -11,6 +11,9 @@ CMakeUserPresets.json
 build/
 build-*/
 cmake-build-*/
+__pycache__/
+src/yolo_test_task/
+logs/
 
 *.d
 *.o
