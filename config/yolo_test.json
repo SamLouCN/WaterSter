@@ -1,0 +1,8 @@
+{
+    "model_path": "/home/sunrise/WaterSter/models/door_in_whl.bin",
+    "class_num": 1,
+    "score_threshold": 0.25,
+    "nms_threshold": 0.7,
+    "score_format": "logits",
+    "box_format": "ltrb_grid"
+}

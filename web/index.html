@@ -1,7 +1,253 @@
 <!DOCTYPE html>
-<html>
-<head>Test for Nginx Web Server</head>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WaterSter 实时监控</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #1a1a1a; font: 14px "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 32px; background: #15024f; color: white; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 28px; font-weight: 300; display: flex; align-items: center; gap: 14px; }
+  .dot { width: 12px; height: 12px; background: #ff6b6b; display: inline-block; }
+  .dot.on { background: #b6e04a; }
+  .meta { font-size: 12px; display: flex; gap: 24px; }
+  main { max-width: 1312px; margin: auto; padding: 16px; }
+  .cam { background: #d1d1d1; overflow: hidden; }
+  .cam-header { padding: 16px; color: #fff; background: #15024f; }
+  .cam-title { font-size: 18px; font-weight: 300; margin-bottom: 12px; }
+  .role { font-size: 12px; opacity: .75; margin-left: 12px; }
+  .cam-stats { display: flex; flex-wrap: wrap; gap: 12px 24px; font-size: 12px; }
+  .cam-stats b { margin-left: 6px; font-size: 20px; font-weight: 300; font-variant-numeric: tabular-nums; }
+  .cam-body { position: relative; aspect-ratio: 4/3; background: #0d0d0d; min-height: 180px; }
+  canvas { width: 100%; height: 100%; object-fit: contain; position: absolute; inset: 0; }
+  .placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ddd; background: #0d0d0ddd; padding: 24px; text-align: center; }
+  [hidden] { display: none !important; }
+  .cam-footer { padding: 12px 16px; color: #555; font-size: 12px; line-height: 1.8; }
+  button { margin-left: 12px; padding: 5px 12px; border: 1px solid #999; background: white; cursor: pointer; }
+  @media(max-width:640px) { header { padding: 14px 18px; } h1 { font-size: 22px; } main { padding: 10px; } }
+</style>
+</head>
 <body>
-    <h1>WATERSTER WEB SERVICE</h1>
+<header>
+  <h1><span id="camera-dot" class="dot" aria-hidden="true"></span>WaterSter 实时监控</h1>
+  <div class="meta"><span id="camera-state" role="status" aria-live="polite">正在连接…</span><time id="clock">--:--:--</time></div>
+</header>
+<main><section class="cam" aria-label="前视摄像头">
+  <div class="cam-header">
+    <div class="cam-title">cam1 · YOLO 检测<span class="role" id="camera-device">/dev/video0 · NV12</span></div>
+    <div class="cam-stats">
+      <span>采集 FPS<b id="front-fps">--</b></span>
+      <span>推理 FPS<b id="yolo-fps">--</b></span>
+      <span>显示 FPS<b id="display-fps">--</b></span>
+      <span>处理耗时<b id="process-ms">--</b> ms</span>
+      <span>最近显示帧<b id="display-sequence">--</b></span>
+      <span>距上次显示<b id="display-age">--</b> ms</span>
+    </div>
+  </div>
+  <div class="cam-body" id="camera-body">
+    <canvas id="camera" width="640" height="480" aria-label="带 YOLO 检测框的实时画面"></canvas>
+    <div class="placeholder" id="camera-placeholder"><span id="placeholder-text">等待画面…</span></div>
+  </div>
+  <div class="cam-footer">显示最新检测帧，推流上限 30 FPS；自动丢弃未显示的旧帧，断流自动重连。处理耗时从相机解码完成计起，不代表端到端显示延迟。<button id="reconnect" type="button">重新连接</button></div>
+</section></main>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const canvas = $('camera');
+  const context = canvas.getContext('2d', {alpha: false});
+  const decoder = new TextDecoder();
+  const session = (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+  let closed = false, controller = null, generation = 0, reconnectTimer = null;
+  let pending = null, rendering = false, streamStarted = 0, lastDraw = 0;
+  let displayedSequence = 0, displayedRun = '', displayed = 0, dropped = 0, reconnects = 0;
+  let lastDecode = 0, lastDrawCost = 0, fpsStart = performance.now(), fpsCount = 0;
+  let displayedFps = 0, healthError = '', healthTimer = null;
+  let streamError = '';
+  let streamFailures = 0, snapshotMode = false;
+
+  function state(text, online) {
+    $('camera-state').textContent = text;
+    $('camera-dot').classList.toggle('on', online);
+  }
+  function placeholder(text) {
+    $('placeholder-text').textContent = text;
+    $('camera-placeholder').hidden = false;
+  }
+  function stopStream() {
+    generation += 1;
+    if (controller) controller.abort();
+    controller = null;
+    pending = null;
+  }
+  function reconnect(reason) {
+    if (closed || document.hidden || reconnectTimer !== null) return;
+    stopStream();
+    state(reason, false);
+    placeholder(reason);
+    reconnects += 1;
+    streamError = reason;
+    if (++streamFailures >= 2) snapshotMode = true;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 1000);
+  }
+  async function renderLatest() {
+    if (rendering) return;
+    rendering = true;
+    try {
+      while (pending && !closed) {
+        const frame = pending;
+        pending = null;
+        const decodeAt = performance.now();
+        const bitmap = await createImageBitmap(new Blob([frame.jpeg], {type: 'image/jpeg'}));
+        try {
+          if (frame.generation !== generation) continue;
+          const decodedAt = performance.now();
+          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+            canvas.width = bitmap.width; canvas.height = bitmap.height;
+            $('camera-body').style.aspectRatio = `${bitmap.width} / ${bitmap.height}`;
+          }
+          context.drawImage(bitmap, 0, 0);
+          lastDraw = performance.now();
+          lastDecode = decodedAt - decodeAt;
+          lastDrawCost = lastDraw - decodedAt;
+          displayedSequence = frame.sequence;
+          streamError = '';
+          displayedRun = frame.run;
+          displayed += 1; fpsCount += 1;
+          $('display-sequence').textContent = displayedSequence;
+          $('camera-placeholder').hidden = true;
+          if (!healthError) state('检测画面在线', true);
+        } finally { bitmap.close(); }
+      }
+    } catch (error) { reconnect(`画面解码失败：${error.message}`); }
+    finally { rendering = false; }
+  }
+  async function connect() {
+    if (closed || document.hidden) return;
+    stopStream();
+    const thisGeneration = generation;
+    const currentController = new AbortController();
+    controller = currentController;
+    streamStarted = performance.now();
+    let reader;
+    try {
+      if (snapshotMode) {
+        while (!closed && thisGeneration === generation) {
+          const requestAt = performance.now();
+          const timeout = setTimeout(() => currentController.abort(), 3000);
+          let response, jpeg;
+          try {
+            response = await fetch(`/frame.jpg?t=${Date.now()}`,
+              {cache: 'no-store', signal: currentController.signal});
+            if (!response.ok) throw new Error(`视频服务 HTTP ${response.status}`);
+            jpeg = new Uint8Array(await response.arrayBuffer());
+          } finally { clearTimeout(timeout); }
+          if (thisGeneration !== generation) return;
+          if (pending) dropped += 1;
+          pending = {jpeg, sequence: Number(response.headers.get('X-Frame-Sequence')),
+            run: response.headers.get('X-Run-Id') || '', generation: thisGeneration};
+          void renderLatest();
+          await new Promise(resolve => setTimeout(resolve, Math.max(0, 1000 / 30 - (performance.now() - requestAt))));
+        }
+        return;
+      }
+      const response = await fetch(`/stream.mjpg?transport=fetch&fps=30&t=${Date.now()}`,
+        {cache: 'no-store', signal: currentController.signal});
+      if (!response.ok || !response.body) throw new Error(`视频服务 HTTP ${response.status}`);
+      reader = response.body.getReader();
+      let buffer = new Uint8Array(0), expected = null, sequence = 0, run = '';
+      while (!closed && thisGeneration === generation) {
+        const {value, done} = await reader.read();
+        if (done) throw new Error('视频连接结束');
+        const combined = new Uint8Array(buffer.length + value.length);
+        combined.set(buffer); combined.set(value, buffer.length); buffer = combined;
+        while (true) {
+          if (expected === null) {
+            let end = -1;
+            for (let i = 0; i + 3 < buffer.length; i++) {
+              if (buffer[i] === 13 && buffer[i+1] === 10 && buffer[i+2] === 13 && buffer[i+3] === 10) { end = i; break; }
+            }
+            if (end < 0) { if (buffer.length > 8192) throw new Error('视频头过长'); break; }
+            const headers = decoder.decode(buffer.subarray(0, end));
+            const length = /Content-Length:\s*(\d+)/i.exec(headers);
+            const id = /X-Frame-Sequence:\s*(\d+)/i.exec(headers);
+            const runId = /X-Run-Id:\s*([a-z0-9]+)/i.exec(headers);
+            if (!length || !id) throw new Error('视频帧头缺少长度或帧号');
+            expected = Number(length[1]); sequence = Number(id[1]);
+            run = runId ? runId[1] : '';
+            if (!(expected > 0 && expected <= 4 * 1024 * 1024)) throw new Error('视频帧长度异常');
+            buffer = buffer.slice(end + 4);
+          }
+          if (buffer.length < expected) break;
+          if (pending) dropped += 1;
+          pending = {jpeg: buffer.slice(0, expected), sequence, run, generation: thisGeneration};
+          buffer = buffer.slice(expected); expected = null;
+          // Decode one frame at a time; receiving can replace the pending frame.
+          void renderLatest();
+        }
+      }
+    } catch (error) {
+      if (thisGeneration === generation) reconnect(error.name === 'AbortError' ? '取帧超时，正在重连…' : error.message);
+    } finally {
+      if (reader) { try { await reader.cancel(); } catch (_) {} }
+    }
+  }
+  async function pollHealth() {
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), 2500);
+    try {
+      const response = await fetch('/health', {cache: 'no-store', signal: abort.signal});
+      const data = await response.json();
+      if (!response.ok || !data.running || data.error) throw new Error(data.error || '后端正在恢复');
+      healthError = '';
+      $('front-fps').textContent = Number(data.capture_fps).toFixed(1);
+      $('yolo-fps').textContent = Number(data.yolo_fps).toFixed(1);
+      $('process-ms').textContent = Number(data.frame_timing.source_to_publish_ms).toFixed(1);
+      $('camera-device').textContent = `${data.device} · ${data.width} × ${data.height}`;
+    } catch (error) {
+      healthError = error.message;
+      state(`后端异常：${healthError}`, false);
+      placeholder(`后端异常，等待自动恢复：${healthError}`);
+      $('front-fps').textContent = '--'; $('yolo-fps').textContent = '--';
+    } finally {
+      clearTimeout(timeout);
+      if (!closed) healthTimer = setTimeout(pollHealth, 1500);
+    }
+  }
+  const watchdog = setInterval(() => {
+    const now = performance.now();
+    $('clock').textContent = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+    $('display-age').textContent = lastDraw ? Math.round(now - lastDraw) : '--';
+    if (now - fpsStart >= 1000) {
+      displayedFps = fpsCount * 1000 / (now - fpsStart);
+      $('display-fps').textContent = displayedFps.toFixed(1);
+      fpsStart = now; fpsCount = 0;
+    }
+    if (!document.hidden && now - Math.max(lastDraw, streamStarted) > 3500) reconnect('超过 3.5 秒没有新画面，正在重连…');
+  }, 500);
+  const telemetry = setInterval(() => {
+    if (closed || document.hidden) return;
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), 1500);
+    fetch('/client-metrics', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      signal: abort.signal, body: JSON.stringify({session, sequence: displayedSequence, frame_run: displayedRun, error: streamError.slice(0, 300),
+        displayed_frames: displayed, dropped_frames: dropped, reconnects, display_fps: displayedFps,
+        decode_ms: lastDecode, draw_ms: lastDrawCost, display_idle_ms: lastDraw ? performance.now() - lastDraw : null})})
+      .catch(() => {}).finally(() => clearTimeout(timeout));
+  }, 3000);
+  $('reconnect').onclick = () => { clearTimeout(reconnectTimer); reconnectTimer = null; reconnect('正在重新连接…'); };
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(reconnectTimer); reconnectTimer = null; stopStream(); }
+    else { connect(); }
+  });
+  window.addEventListener('pagehide', () => {
+    closed = true; stopStream(); clearTimeout(reconnectTimer); clearTimeout(healthTimer);
+    clearInterval(watchdog); clearInterval(telemetry);
+  });
+  window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+  connect(); pollHealth();
+})();
+</script>
 </body>
 </html>
